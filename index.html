@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Red Light Green Light</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body { background:#000; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; touch-action:none; user-select:none; font-family:'Courier New',monospace; }
+#gameCanvas { display:block; max-width:100vw; max-height:100vh; }
+#ui-overlay { position:absolute; top:0; left:0; width:100%; pointer-events:none; display:flex; flex-direction:column; align-items:center; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize(){
+  W = Math.min(window.innerWidth, 480);
+  H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+}
+resize();
+window.addEventListener('resize', () => { resize(); });
+
+// ---- GAME STATE ----
+const STATE = { WAITING:0, GREEN:1, RED:2, TURNING:3, GAMEOVER:4, WIN:5 };
+let gameState = STATE.WAITING;
+let score = 0;
+let wave = 1;
+let timer = 0;
+let lightTimer = 0;
+let lightDuration = 180;
+let dollTurnProgress = 0; // 0=facing away, 1=facing player
+let dollFacing = 0; // 0=away, 1=toward
+let shakeTimer = 0;
+let gunFlash = 0;
+let survivorCount = 0;
+let deadThisRound = [];
+
+// ---- PLAYER ----
+const GROUND_Y_RATIO = 0.72;
+let GROUND_Y;
+const FINISH_Y_RATIO = 0.38;
+let FINISH_Y;
+
+let player = {};
+
+function resetPlayer() {
+  GROUND_Y = H * GROUND_Y_RATIO;
+  FINISH_Y = H * FINISH_Y_RATIO;
+  player = {
+    x: W * 0.5,
+    y: GROUND_Y,
+    vy: 0,
+    moving: false,
+    dead: false,
+    won: false,
+    number: Math.floor(Math.random()*900)+100,
+    suit: '#4a7c59',
+    frame: 0,
+    frameTimer: 0,
+    legAngle: 0,
+    legDir: 1,
+  };
+}
+
+// ---- BOTS ----
+let bots = [];
+function spawnBots(count=18) {
+  bots = [];
+  const colors = ['#4a7c59','#3d6b4f','#5a8c69'];
+  for(let i=0;i<count;i++){
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    bots.push({
+      x: W*(0.12 + col*0.28 + (row%2)*0.14),
+      y: GROUND_Y + 20 + row*38,
+      speed: 0.4 + Math.random()*0.5,
+      moving: false,
+      dead: false,
+      won: false,
+      number: Math.floor(Math.random()*900)+100,
+      suit: colors[Math.floor(Math.random()*colors.length)],
+      frame: 0,
+      frameTimer: 0,
+      legAngle: 0,
+      legDir: 1,
+      thinkTimer: Math.floor(Math.random()*30),
+      reckless: Math.random() < 0.25,
+      bloodSplat: null,
+    });
+  }
+}
+
+// ---- DOLL ----
+const doll = { x: 0, y: 0 };
+
+// ---- HELPERS ----
+function lerp(a,b,t){ return a+(b-a)*t; }
+function easeInOut(t){ return t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2; }
+
+// ---- DRAW FUNCTIONS ----
+
+function drawSky(){
+  const sky = ctx.createLinearGradient(0,0,0,H*0.5);
+  sky.addColorStop(0,'#87CEEB');
+  sky.addColorStop(1,'#d4eaf7');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0,0,W,H*0.5);
+
+  // clouds
+  ctx.fillStyle='rgba(255,255,255,0.85)';
+  [[W*0.1,H*0.06,40,18],[W*0.55,H*0.04,55,22],[W*0.8,H*0.09,35,14]].forEach(([x,y,rw,rh])=>{
+    ctx.beginPath();ctx.ellipse(x,y,rw,rh,0,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.ellipse(x-rw*0.3,y+rh*0.3,rw*0.6,rh*0.7,0,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.ellipse(x+rw*0.3,y+rh*0.3,rw*0.6,rh*0.7,0,0,Math.PI*2);ctx.fill();
+  });
+}
+
+function drawGround(){
+  // desert ground
+  const g = ctx.createLinearGradient(0,H*0.46,0,H);
+  g.addColorStop(0,'#c8a96e');
+  g.addColorStop(0.15,'#d4b47a');
+  g.addColorStop(1,'#b89660');
+  ctx.fillStyle=g;
+  ctx.fillRect(0,H*0.46,W,H-H*0.46);
+
+  // horizon line / dirt texture
+  ctx.fillStyle='#c19a5b';
+  ctx.fillRect(0,H*0.455,W,4);
+}
+
+function drawDeadTree(){
+  const tx = W*0.5, ty = H*0.25;
+  ctx.strokeStyle='#3a2a1a';
+  ctx.lineWidth=6;
+  ctx.lineCap='round';
+  // trunk
+  ctx.beginPath();ctx.moveTo(tx,H*0.46);ctx.lineTo(tx,ty+20);ctx.stroke();
+  // branches
+  ctx.lineWidth=3;
+  const branches=[[-30,-30,-55,-55],[-20,-20,-10,-50],[30,-30,55,-55],[20,-20,10,-50],[-35,-15,-50,-5],[35,-15,50,-5]];
+  for(const [dx1,dy1,dx2,dy2] of branches){
+    ctx.beginPath();ctx.moveTo(tx+dx1*0.6,ty+dy1*0.6+20);ctx.lineTo(tx+dx2*0.7,ty+dy2*0.7+20);ctx.stroke();
+  }
+}
+
+function drawGuards(){
+  // Side guards
+  const guardPositions = [W*0.08, W*0.18, W*0.28, W*0.72, W*0.82, W*0.92];
+  for(const gx of guardPositions){
+    drawPixelPerson(gx, H*0.46, '#8b1a1a', '#222', 0.75, false, false);
+  }
+}
+
+function drawDoll(){
+  const dx = W*0.5;
+  const dy = H*0.46;
+  const facing = dollFacing > 0.5;
+
+  ctx.save();
+  if(facing) ctx.scale(-1,1), ctx.translate(-W,0);
+
+  const ddx = facing ? W-dx : dx;
+
+  // body - orange dress
+  ctx.fillStyle='#e8821a';
+  ctx.beginPath();
+  ctx.moveTo(ddx-10, dy-60);
+  ctx.lineTo(ddx+10, dy-60);
+  ctx.lineTo(ddx+14, dy-20);
+  ctx.lineTo(ddx-14, dy-20);
+  ctx.closePath();
+  ctx.fill();
+
+  // head
+  ctx.fillStyle='#f5c9a0';
+  ctx.beginPath();ctx.ellipse(ddx,dy-75,11,13,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#1a1a1a';
+  ctx.beginPath();ctx.ellipse(ddx,dy-82,11,8,0,0,Math.PI*2);ctx.fill(); // hair
+
+  // eyes (creepy)
+  if(facing){
+    ctx.fillStyle='#1a1a1a';
+    ctx.beginPath();ctx.ellipse(ddx-4,dy-76,3,4,0,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.ellipse(ddx+4,dy-76,3,4,0,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#fff';
+    ctx.beginPath();ctx.arc(ddx-4,dy-77,1,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(ddx+4,dy-77,1,0,Math.PI*2);ctx.fill();
+  }
+
+  // legs
+  ctx.strokeStyle='#fff';ctx.lineWidth=4;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(ddx-5,dy-20);ctx.lineTo(ddx-7,dy);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(ddx+5,dy-20);ctx.lineTo(ddx+7,dy);ctx.stroke();
+
+  ctx.restore();
+
+  // Light indicator above doll
+  const lightX = W*0.5, lightY = H*0.28;
+  const isGreen = gameState === STATE.GREEN;
+  const isRed = gameState === STATE.RED;
+  const lightColor = isGreen ? '#00ff44' : isRed ? '#ff2222' : '#ffaa00';
+  const glowColor = isGreen ? 'rgba(0,255,68,0.3)' : isRed ? 'rgba(255,34,34,0.3)' : 'rgba(255,170,0,0.2)';
+
+  ctx.beginPath();ctx.arc(lightX,lightY,16,0,Math.PI*2);
+  ctx.fillStyle=glowColor;ctx.fill();
+  ctx.beginPath();ctx.arc(lightX,lightY,10,0,Math.PI*2);
+  ctx.fillStyle=lightColor;ctx.fill();
+  ctx.strokeStyle='#333';ctx.lineWidth=2;ctx.stroke();
+}
+
+function drawPixelPerson(x, y, suitColor, maskColor, scale=1, walking=false, isDead=false, legAngle=0, number=0, bloodSplat=null){
+  if(isDead){
+    // draw dead body lying flat
+    ctx.save();ctx.translate(x,y);
+    ctx.fillStyle=suitColor;
+    ctx.fillRect(-14*scale,-4*scale,28*scale,8*scale);
+    ctx.fillStyle='#f5c9a0';
+    ctx.beginPath();ctx.ellipse(16*scale,0,6*scale,5*scale,0,0,Math.PI*2);ctx.fill();
+    if(bloodSplat){
+      ctx.fillStyle='rgba(180,0,0,0.7)';
+      ctx.beginPath();ctx.ellipse(-5*scale,0,bloodSplat.r*scale,bloodSplat.r*0.4*scale,0.3,0,Math.PI*2);ctx.fill();
+    }
+    ctx.restore();
+    return;
+  }
+
+  ctx.save();ctx.translate(x,y);
+
+  // legs
+  ctx.strokeStyle=suitColor;ctx.lineWidth=4*scale;ctx.lineCap='round';
+  const lAngle = walking ? Math.sin(legAngle)*0.4 : 0;
+  ctx.beginPath();ctx.moveTo(0,-2*scale);
+  ctx.lineTo(-5*scale+Math.sin(lAngle)*8*scale, 16*scale);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(0,-2*scale);
+  ctx.lineTo(5*scale+Math.sin(-lAngle)*8*scale, 16*scale);ctx.stroke();
+
+  // body
+  ctx.fillStyle=suitColor;
+  ctx.fillRect(-9*scale,-22*scale,18*scale,22*scale);
+
+  // arms
+  ctx.strokeStyle=suitColor;ctx.lineWidth=3*scale;
+  ctx.beginPath();ctx.moveTo(-9*scale,-18*scale);ctx.lineTo(-16*scale,-8*scale);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(9*scale,-18*scale);ctx.lineTo(16*scale,-8*scale);ctx.stroke();
+
+  // head
+  ctx.fillStyle='#f5c9a0';
+  ctx.beginPath();ctx.ellipse(0,-30*scale,8*scale,9*scale,0,0,Math.PI*2);ctx.fill();
+
+  // mask
+  ctx.fillStyle=maskColor;
+  ctx.beginPath();ctx.ellipse(0,-30*scale,7*scale,8*scale,0,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.stroke();
+  // mask eyes
+  ctx.fillStyle='#333';
+  ctx.beginPath();ctx.arc(-2.5*scale,-31*scale,1.5*scale,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.arc(2.5*scale,-31*scale,1.5*scale,0,Math.PI*2);ctx.fill();
+
+  // number tag
+  if(number && scale >= 0.9){
+    ctx.fillStyle='#eee';
+    ctx.font=`bold ${7*scale}px monospace`;
+    ctx.textAlign='center';
+    ctx.fillText(number, 0, -12*scale);
+  }
+
+  ctx.restore();
+}
+
+function drawPlayer(){
+  if(player.dead){
+    // lying on ground
+    ctx.save();ctx.translate(player.x, player.y);
+    ctx.fillStyle=player.suit;
+    ctx.fillRect(-14,-4,28,8);
+    ctx.fillStyle='#f5c9a0';
+    ctx.beginPath();ctx.ellipse(16,0,6,5,0,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(180,0,0,0.8)';
+    ctx.beginPath();ctx.ellipse(0,2,12,4,0,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+    return;
+  }
+  drawPixelPerson(player.x, player.y, player.suit, '#222', 1.1, player.moving, false, player.legAngle, player.number);
+}
+
+function drawHUD(){
+  const pad = 10;
+  // Timer box
+  ctx.fillStyle='rgba(0,0,0,0.75)';
+  ctx.fillRect(pad,pad,90,38);
+  ctx.fillStyle='#ff3333';
+  ctx.font='bold 28px monospace';
+  ctx.textAlign='left';
+  const secs = Math.max(0, Math.ceil(timer/60));
+  ctx.fillText(`${String(Math.floor(secs/60)).padStart(2,'0')}:${String(secs%60).padStart(2,'0')}`, pad+8, pad+30);
+
+  // Light status
+  const lightText = gameState===STATE.GREEN?'GREEN LIGHT':gameState===STATE.RED?'RED LIGHT!':'...';
+  const lightCol = gameState===STATE.GREEN?'#00ff44':gameState===STATE.RED?'#ff3333':'#ffcc00';
+  ctx.fillStyle='rgba(0,0,0,0.75)';
+  const tw = ctx.measureText(lightText).width + 20;
+  ctx.fillRect(W/2-tw/2, pad, tw, 32);
+  ctx.fillStyle=lightCol;
+  ctx.font='bold 16px monospace';
+  ctx.textAlign='center';
+  ctx.fillText(lightText, W/2, pad+22);
+
+  // Survivor count
+  ctx.fillStyle='rgba(0,0,0,0.75)';
+  ctx.fillRect(W-95,pad,85,38);
+  ctx.fillStyle='#fff';
+  ctx.font='bold 13px monospace';
+  ctx.textAlign='right';
+  ctx.fillText('ALIVE', W-pad, pad+14);
+  ctx.font='bold 22px monospace';
+  ctx.fillText(survivorCount, W-pad, pad+34);
+
+  // Wave
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillRect(W-95,pad+44,85,24);
+  ctx.fillStyle='#ffcc00';
+  ctx.font='bold 12px monospace';
+  ctx.fillText(`WAVE ${wave}`, W-pad, pad+61);
+
+  // Score
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillRect(pad,pad+44,90,24);
+  ctx.fillStyle='#ffcc00';
+  ctx.font='bold 12px monospace';
+  ctx.textAlign='left';
+  ctx.fillText(`Score: ${score}`, pad+5, pad+61);
+
+  // Player number
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillRect(W/2-30,H-36,60,26);
+  ctx.fillStyle='#eee';
+  ctx.font='bold 14px monospace';
+  ctx.textAlign='center';
+  ctx.fillText(`#${player.number}`, W/2, H-18);
+
+  // Instructions
+  if(gameState===STATE.WAITING){
+    ctx.fillStyle='rgba(0,0,0,0.7)';
+    ctx.fillRect(0,H*0.55,W,80);
+    ctx.fillStyle='#fff';
+    ctx.font='bold 16px monospace';
+    ctx.textAlign='center';
+    ctx.fillText('TAP to move forward', W/2, H*0.55+28);
+    ctx.font='13px monospace';
+    ctx.fillStyle='#aaa';
+    ctx.fillText('Stop when RED LIGHT appears!', W/2, H*0.55+52);
+    ctx.fillStyle='#ffcc00';
+    ctx.font='bold 14px monospace';
+    ctx.fillText('TAP TO START', W/2, H*0.55+72);
+  }
+}
+
+function drawGameOver(){
+  ctx.fillStyle='rgba(0,0,0,0.82)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ff2222';
+  ctx.font='bold 36px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('ELIMINATED', W/2, H*0.38);
+  ctx.fillStyle='#fff';
+  ctx.font='20px monospace';
+  ctx.fillText(`Player #${player.number}`, W/2, H*0.48);
+  ctx.fillStyle='#ffcc00';
+  ctx.font='bold 18px monospace';
+  ctx.fillText(`Score: ${score}`, W/2, H*0.56);
+  ctx.fillStyle='#aaa';
+  ctx.font='14px monospace';
+  ctx.fillText('TAP TO PLAY AGAIN', W/2, H*0.68);
+}
+
+function drawWin(){
+  ctx.fillStyle='rgba(0,20,0,0.82)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#00ff44';
+  ctx.font='bold 32px monospace';
+  ctx.textAlign='center';
+  ctx.fillText('YOU SURVIVED!', W/2, H*0.36);
+  ctx.fillStyle='#fff';
+  ctx.font='18px monospace';
+  ctx.fillText(`Wave ${wave} complete!`, W/2, H*0.46);
+  ctx.fillStyle='#ffcc00';
+  ctx.font='bold 20px monospace';
+  ctx.fillText(`Score: ${score}`, W/2, H*0.55);
+  ctx.fillStyle='#aaa';
+  ctx.font='14px monospace';
+  ctx.fillText('TAP FOR NEXT WAVE', W/2, H*0.67);
+}
+
+function drawGunFlash(){
+  if(gunFlash > 0){
+    ctx.fillStyle=`rgba(255,200,0,${gunFlash*0.4})`;
+    ctx.fillRect(0,0,W,H);
+    gunFlash = Math.max(0,gunFlash-0.08);
+  }
+}
+
+// ---- GAME LOGIC ----
+function startGame(){
+  GROUND_Y = H * GROUND_Y_RATIO;
+  FINISH_Y = H * FINISH_Y_RATIO;
+  gameState = STATE.GREEN;
+  timer = 60 * (18 - wave * 1.5);
+  timer = Math.max(timer, 60*8);
+  lightTimer = 0;
+  lightDuration = Math.max(60, 180 - wave*15);
+  dollFacing = 0;
+  dollTurnProgress = 0;
+  resetPlayer();
+  spawnBots(16 + wave*2);
+  countSurvivors();
+}
+
+function nextWave(){
+  wave++;
+  score += 500;
+  startGame();
+}
+
+function countSurvivors(){
+  survivorCount = (player.dead?0:1) + bots.filter(b=>!b.dead).length;
+}
+
+function killEntity(ent){
+  if(ent.dead) return;
+  ent.dead = true;
+  if(ent === player){
+    gameState = STATE.GAMEOVER;
+    gunFlash = 1;
+    shakeTimer = 20;
+  } else {
+    ent.bloodSplat = {r: 8+Math.random()*6};
+    score += 10;
+    gunFlash = Math.min(gunFlash+0.3, 1);
+    shakeTimer = Math.max(shakeTimer, 8);
+  }
+  countSurvivors();
+}
+
+function switchLight(){
+  if(gameState === STATE.RED){
+    gameState = STATE.TURNING;
+    dollTurnProgress = 0;
+  } else if(gameState === STATE.GREEN){
+    gameState = STATE.TURNING;
+    dollTurnProgress = 0;
+    dollFacing = 1; // start turning toward player
+  }
+}
+
+let touching = false;
+
+function update(){
+  if(gameState === STATE.WAITING || gameState === STATE.GAMEOVER || gameState === STATE.WIN) return;
+
+  // Timer
+  timer--;
+  if(timer <= 0 && gameState !== STATE.GAMEOVER && gameState !== STATE.WIN){
+    // Time's up - kill everyone still on field
+    if(!player.won && !player.dead) killEntity(player);
+    bots.forEach(b=>{ if(!b.won && !b.dead) killEntity(b); });
+    if(!player.dead) gameState = STATE.WIN;
+    return;
+  }
+
+  // Doll turning animation
+  if(gameState === STATE.TURNING){
+    dollTurnProgress += 0.06;
+    dollFacing = dollFacing === 1
+      ? easeInOut(Math.min(dollTurnProgress,1))
+      : 1 - easeInOut(Math.min(dollTurnProgress,1));
+
+    if(dollTurnProgress >= 1){
+      if(dollFacing > 0.5){
+        // Now facing players - RED LIGHT
+        gameState = STATE.RED;
+        dollFacing = 1;
+        // Kill anyone moving
+        checkMovers();
+        lightTimer = lightDuration * (0.5 + Math.random()*0.8);
+      } else {
+        gameState = STATE.GREEN;
+        dollFacing = 0;
+        lightTimer = lightDuration * (0.7 + Math.random());
+      }
+    }
+    return;
+  }
+
+  lightTimer--;
+  if(lightTimer <= 0) switchLight();
+
+  // Player movement
+  if(gameState === STATE.GREEN && touching && !player.dead && !player.won){
+    player.moving = true;
+    player.y -= 1.8;
+    player.legAngle += 0.18;
+    if(player.y <= FINISH_Y){ player.won = true; player.y = FINISH_Y; score += 200; }
+  } else {
+    player.moving = false;
+  }
+
+  // Red light check for player
+  if(gameState === STATE.RED && player.moving && !player.dead){
+    // small grace window
+    killEntity(player);
+  }
+
+  // Bots AI
+  for(const bot of bots){
+    if(bot.dead || bot.won) continue;
+    bot.thinkTimer--;
+    if(bot.thinkTimer <= 0){
+      bot.thinkTimer = 10 + Math.floor(Math.random()*20);
+      if(gameState === STATE.GREEN){
+        bot.moving = true;
+      } else if(gameState === STATE.RED){
+        if(bot.reckless && Math.random() < 0.03) bot.moving = true;
+        else bot.moving = false;
+      }
+    }
+    if(bot.moving){
+      bot.y -= bot.speed;
+      bot.legAngle += 0.15;
+      if(bot.y <= FINISH_Y){ bot.won = true; bot.y = FINISH_Y; }
+    }
+
+    // Kill moving bots on red light
+    if(gameState === STATE.RED && bot.moving){
+      if(Math.random() < 0.04) killEntity(bot);
+    }
+  }
+
+  // Check win
+  if(player.won && !bots.some(b=>!b.dead&&!b.won&&b.y>FINISH_Y+10)){
+    gameState = STATE.WIN;
+  }
+  if(!player.dead && bots.every(b=>b.dead||b.won) && player.won){
+    gameState = STATE.WIN;
+  }
+
+  countSurvivors();
+
+  if(shakeTimer>0)shakeTimer--;
+}
+
+function checkMovers(){
+  // Kill anyone moving when light turns red
+  if(player.moving && !player.dead) killEntity(player);
+  for(const bot of bots){
+    if(bot.moving && !bot.dead && Math.random()<0.7) killEntity(bot);
+  }
+}
+
+// ---- RENDER ----
+function render(){
+  ctx.save();
+  if(shakeTimer>0){
+    ctx.translate((Math.random()-0.5)*shakeTimer*0.4,(Math.random()-0.5)*shakeTimer*0.4);
+  }
+
+  drawSky();
+  drawGround();
+  drawDeadTree();
+  drawGuards();
+  drawDoll();
+
+  // Finish line
+  ctx.strokeStyle='rgba(255,20,20,0.8)';
+  ctx.lineWidth=2;
+  ctx.setLineDash([8,8]);
+  ctx.beginPath();ctx.moveTo(0,FINISH_Y+2);ctx.lineTo(W,FINISH_Y+2);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle='rgba(255,20,20,0.15)';
+  ctx.fillRect(0,FINISH_Y-10,W,14);
+
+  // Draw bots behind player
+  for(const bot of bots){
+    if(!bot.dead){
+      drawPixelPerson(bot.x, bot.y, bot.suit, '#222', 0.9, bot.moving, false, bot.legAngle, bot.number);
+    } else {
+      // dead on ground
+      ctx.save();ctx.translate(bot.x,bot.y);
+      ctx.fillStyle=bot.suit;
+      ctx.fillRect(-12,-3,24,7);
+      ctx.fillStyle='#f5c9a0';
+      ctx.beginPath();ctx.ellipse(13,0,5,4,0,0,Math.PI*2);ctx.fill();
+      if(bot.bloodSplat){
+        if(bot.bloodSplat.r < 14) bot.bloodSplat.r += 0.15;
+        ctx.fillStyle='rgba(160,0,0,0.65)';
+        ctx.beginPath();ctx.ellipse(-2,1,bot.bloodSplat.r,bot.bloodSplat.r*0.35,0.2,0,Math.PI*2);ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  drawPlayer();
+
+  // Won players near finish
+  for(const bot of bots.filter(b=>b.won)){
+    drawPixelPerson(bot.x, FINISH_Y-5, bot.suit, '#222', 0.9, false, false, 0, bot.number);
+  }
+  if(player.won){
+    drawPixelPerson(player.x, FINISH_Y-5, player.suit, '#222', 1.0, false, false, 0, player.number);
+  }
+
+  ctx.restore();
+
+  drawGunFlash();
+  drawHUD();
+
+  if(gameState === STATE.GAMEOVER) drawGameOver();
+  if(gameState === STATE.WIN) drawWin();
+}
+
+// ---- LOOP ----
+function loop(){
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ---- INPUT ----
+canvas.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  touching = true;
+  if(gameState===STATE.WAITING){ startGame(); return; }
+  if(gameState===STATE.GAMEOVER){ wave=1;score=0;startGame(); gameState=STATE.WAITING; return; }
+  if(gameState===STATE.WIN){ nextWave(); return; }
+},{passive:false});
+
+canvas.addEventListener('touchend', e=>{
+  e.preventDefault();
+  touching = false;
+},{passive:false});
+
+canvas.addEventListener('mousedown', e=>{
+  touching = true;
+  if(gameState===STATE.WAITING){ startGame(); return; }
+  if(gameState===STATE.GAMEOVER){ wave=1;score=0;startGame(); gameState=STATE.WAITING; return; }
+  if(gameState===STATE.WIN){ nextWave(); return; }
+});
+canvas.addEventListener('mouseup', ()=>{ touching=false; });
+
+// ---- INIT ----
+GROUND_Y = H * GROUND_Y_RATIO;
+FINISH_Y = H * FINISH_Y_RATIO;
+gameState = STATE.WAITING;
+resetPlayer();
+spawnBots(18);
+countSurvivors();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
